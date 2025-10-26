@@ -2,7 +2,8 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { supabase } from '@/lib/supabase-browser';
+// removed top-level supabase import to avoid import-time throws in build
+// lazy-load browser supabase below when needed
 
 type Hospital = {
   id: string;
@@ -125,6 +126,20 @@ function Dropdown<T extends string | number | null>(props: {
   );
 }
 
+/* ---------------------- supabase lazy loader ---------------------- */
+/**
+ * Lazy-load the browser supabase client so we never import it at module-load time.
+ * This prevents build-time / server-side import problems.
+ */
+const _supabaseRef: { current: any | null } = { current: null };
+async function getSupabase() {
+  if (_supabaseRef.current) return _supabaseRef.current;
+  // dynamic import so bundlers know this is browser-only usage
+  const mod = await import('@/lib/supabase-browser');
+  _supabaseRef.current = mod.getSupabaseBrowser();
+  return _supabaseRef.current;
+}
+
 /* ---------------------- Main Page ---------------------- */
 export default function Page() {
   const [rows, setRows] = useState<Hospital[]>([]);
@@ -138,11 +153,13 @@ export default function Page() {
   const [hasColdEmailedColumn, setHasColdEmailedColumn] = useState(false);
 
   const { toasts, push } = useToasts(3400);
+  const channelRef = useRef<any | null>(null);
 
   // fetch rows (safe select *)
   const fetchRows = async () => {
     setLoading(true);
     try {
+      const supabase = await getSupabase();
       const { data, error } = await supabase.from('hospitals').select('*').order('name', { ascending: true });
       if (error) {
         console.error('Supabase fetch error', error);
@@ -161,22 +178,57 @@ export default function Page() {
   };
 
   useEffect(() => {
-    fetchRows();
+    // load rows and subscribe to realtime changes (browser only)
+    let mounted = true;
 
-    // subscribe to realtime changes for hospitals
-    const channel = supabase
-      .channel('realtime-hospitals')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'hospitals' }, () => {
-        fetchRows();
-      })
-      .subscribe();
+    (async () => {
+      await fetchRows();
+
+      try {
+        const supabase = await getSupabase();
+        // create a realtime channel (API may differ by client version)
+        try {
+          const channel = supabase
+            .channel('realtime-hospitals')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'hospitals' }, () => {
+              // refresh on any change
+              fetchRows();
+            })
+            .subscribe();
+          channelRef.current = channel;
+        } catch (e) {
+          // older/newer supabase-js versions differ; try fallback
+          if (typeof supabase.from === 'function') {
+            // fallback to legacy realtime (best-effort)
+            try {
+              const sub = supabase.from('hospitals').on('*', () => fetchRows()).subscribe();
+              channelRef.current = sub;
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch (e) {
+        // ignore subscription errors for now
+        console.warn('Realtime subscribe failed', e);
+      }
+    })();
 
     return () => {
+      mounted = false;
+      // cleanup realtime
       try {
-        if (typeof (channel as any).unsubscribe === 'function') (channel as any).unsubscribe();
-        else if (typeof supabase.removeChannel === 'function') supabase.removeChannel(channel);
+        const supabase = _supabaseRef.current;
+        if (channelRef.current) {
+          try {
+            if (typeof channelRef.current.unsubscribe === 'function') channelRef.current.unsubscribe();
+            else if (supabase && typeof supabase.removeChannel === 'function') supabase.removeChannel(channelRef.current);
+          } catch (e) {
+            console.warn('Error cleaning realtime channel', e);
+          }
+        }
       } catch (e) {
-        console.warn('Error cleaning realtime channel', e);
+        // ignore cleanup errors
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -239,6 +291,7 @@ export default function Page() {
     setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, status: target } : r)));
 
     try {
+      const supabase = await getSupabase();
       const { error } = await supabase.from('hospitals').update({ status: target }).eq('id', id);
       if (error) {
         console.error('Update status error', error);
@@ -269,6 +322,7 @@ export default function Page() {
     setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, cold_emailed: target } : r)));
 
     try {
+      const supabase = await getSupabase();
       const { error } = await supabase.from('hospitals').update({ cold_emailed: target }).eq('id', id);
 
       if (error) {
@@ -304,6 +358,7 @@ export default function Page() {
     setRows((prevRows) => prevRows.map((r) => (ids.includes(r.id) ? { ...r, status: target } : r)));
 
     try {
+      const supabase = await getSupabase();
       const { error } = await supabase.from('hospitals').update({ status: target }).in('id', ids);
       if (error) {
         console.error('Bulk status error', error);
@@ -332,6 +387,7 @@ export default function Page() {
     setRows((prevRows) => prevRows.map((r) => (ids.includes(r.id) ? { ...r, cold_emailed: markAs } : r)));
 
     try {
+      const supabase = await getSupabase();
       const { error } = await supabase.from('hospitals').update({ cold_emailed: markAs }).in('id', ids);
       if (error) {
         console.error('Bulk cold_emailed error', error);

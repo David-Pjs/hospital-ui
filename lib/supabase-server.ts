@@ -4,20 +4,32 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+let _serverClient: SupabaseClient | null = null;
+
 /**
- * Create and return a Supabase server client when called.
- * Throws only when called and required env is missing.
- * This prevents throwing at module import time (which breaks Next.js build).
+ * Return a Supabase server client. Creation is deferred until called,
+ * and the function throws only if required server env is missing.
+ *
+ * IMPORTANT: DO NOT expose SUPABASE_SERVICE_ROLE_KEY to the browser.
  */
 export function getSupabaseServer(): SupabaseClient {
+  if (_serverClient) return _serverClient;
+
   if (!SUPABASE_URL) {
-    throw new Error("Missing SUPABASE_URL (set NEXT_PUBLIC_SUPABASE_URL or SUPABASE_URL).");
-  }
-  if (!SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY (server-only).");
+    throw new Error(
+      "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL. Set NEXT_PUBLIC_SUPABASE_URL (or SUPABASE_URL) in .env.local and in Vercel envs."
+    );
   }
 
-  return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  if (!SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error(
+      "Missing SUPABASE_SERVICE_ROLE_KEY (server-only). Add this secret to Vercel Environment Variables for this project."
+    );
+  }
+
+  _serverClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
+
+  return _serverClient;
 }
