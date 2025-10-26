@@ -1,296 +1,679 @@
-"use client";
+// app/page.tsx
+'use client';
 
-import { useEffect, useMemo, useState } from "react";
-import { supabase } from "@/lib/supabase";
-import Papa from "papaparse";
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { supabase } from '@/lib/supabase-browser';
 
 type Hospital = {
   id: string;
-  name: string;
-  city: string | null;
-  website: string | null;
-  telemedicine: boolean | null;
-  digital_services: string | null;
-  emails: string[] | null;
-  phones: string[] | null;
-  linkedin: string | null;
-  address: string | null;
-  status: "new"|"queued"|"contacted"|"replied"|"won"|"lost"|"bad";
-  manual_rating: number; // 0..5
-  score: number;         // 0..100
-  created_at: string;
-  updated_at: string;
+  name?: string | null;
+  city?: string | null;
+  website?: string | null;
+  telemedicine?: boolean | null;
+  emails?: string[] | null;
+  phones?: string[] | null;
+  address?: string | null;
+  status?: string | null;
+  cold_emailed?: boolean | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  [key: string]: any;
 };
 
-const STATUSES = ["new","queued","contacted","replied","won","lost","bad"] as const;
+/* ---------------------- Small Toast system ---------------------- */
+type ToastMsg = { id: string; type: 'success' | 'error' | 'info'; text: string };
 
-function blendScore(auto_score: number, manual_rating: number){
-  // we don't have auto_score column here; score is manual-driven for now
-  // you can compute auto on client if you want—keeping simple:
-  const manualScaled = (manual_rating || 0) * 20; // 0..100
-  return Math.round(manualScaled * 100) / 100;
+function useToasts(ttl = 3500) {
+  const [toasts, setToasts] = useState<ToastMsg[]>([]);
+  const push = (t: Omit<ToastMsg, 'id'>) => {
+    const id = String(Date.now()) + Math.random().toString(36).slice(2, 7);
+    setToasts((s) => [...s, { ...t, id }]);
+    setTimeout(() => setToasts((s) => s.filter((x) => x.id !== id)), ttl);
+  };
+  const clear = () => setToasts([]);
+  return { toasts, push, clear };
 }
 
-export default function Home() {
+function Toasts({ toasts }: { toasts: ToastMsg[] }) {
+  return (
+    <div className="fixed z-50 right-4 bottom-4 max-w-sm w-full sm:right-6 sm:bottom-6">
+      <div className="flex flex-col gap-2">
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            role="status"
+            aria-live="polite"
+            className={`rounded-lg px-4 py-3 shadow-md border ${
+              t.type === 'success'
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : t.type === 'error'
+                ? 'bg-rose-50 border-rose-200 text-rose-800'
+                : 'bg-slate-50 border-slate-200 text-slate-800'
+            }`}
+          >
+            <div className="text-sm">{t.text}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------- Small Dropdown (keeps your previous behavior) ---------------------- */
+function Dropdown<T extends string | number | null>(props: {
+  label?: string;
+  items: { value: T; label: string }[];
+  selected?: T;
+  onSelect: (v: T) => void;
+  className?: string;
+}) {
+  const { items, onSelect, selected, label, className } = props;
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    function onDoc(e: MouseEvent) {
+      if (!ref.current) return;
+      if (!ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setOpen(false);
+    }
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, []);
+
+  return (
+    <div ref={ref} className="relative inline-block text-left">
+      <button
+        type="button"
+        onClick={() => setOpen((s) => !s)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className={`flex items-center gap-2 px-3 py-2 rounded-md border border-slate-200 bg-white shadow-sm text-sm font-medium ${className ?? ''}`}
+      >
+        {label ?? (selected ? String(selected) : 'Select')}
+        <svg className="w-3 h-3" viewBox="0 0 20 20" fill="currentColor" aria-hidden>
+          <path d="M5.23 7.21a.75.75 0 011.06-.02L10 10.83l3.71-3.64a.75.75 0 011.04 1.08l-4.25 4.17a.75.75 0 01-1.04 0L5.25 8.27a.75.75 0 01-.02-1.06z" />
+        </svg>
+      </button>
+
+      {open && (
+        <div role="menu" aria-orientation="vertical" className="absolute right-0 mt-2 w-44 rounded-md bg-white shadow-lg ring-1 ring-black ring-opacity-5 z-50">
+          <div className="py-1">
+            {items.map((it) => (
+              <button
+                key={String(it.value)}
+                onClick={() => {
+                  onSelect(it.value);
+                  setOpen(false);
+                }}
+                role="menuitem"
+                className={`w-full text-left px-3 py-2 text-sm ${selected === it.value ? 'font-semibold bg-emerald-50' : 'hover:bg-slate-100'}`}
+              >
+                {it.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------- Main Page ---------------------- */
+export default function Page() {
   const [rows, setRows] = useState<Hospital[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [q, setQ] = useState("");
-  const [city, setCity] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
-  const [sortKey, setSortKey] = useState<keyof Hospital>("score");
-  const [sortDir, setSortDir] = useState<"asc"|"desc">("desc");
+  const [loading, setLoading] = useState(false);
+  const [q, setQ] = useState('');
+  const [city, setCity] = useState('All cities');
+  const [status, setStatus] = useState('All statuses');
+  const [sortKey, setSortKey] = useState<'name' | 'created_at'>('name');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [hasColdEmailedColumn, setHasColdEmailedColumn] = useState(false);
 
-  // quick add form
-  const [form, setForm] = useState({
-    name: "", city: "", website: "", emails: "", phones: "",
-    linkedin: "", address: "", telemedicine: "unknown", digital_services: ""
-  });
+  const { toasts, push } = useToasts(3400);
 
-  async function fetchRows(){
+  // fetch rows (safe select *)
+  const fetchRows = async () => {
     setLoading(true);
-    const { data, error } = await supabase
-      .from("hospitals")
-      .select("*")
-      .order("score", { ascending: false })
-      .limit(5000);
-    if (error) console.error(error);
-    setRows((data || []) as Hospital[]);
-    setLoading(false);
-  }
+    try {
+      const { data, error } = await supabase.from('hospitals').select('*').order('name', { ascending: true });
+      if (error) {
+        console.error('Supabase fetch error', error);
+        push({ type: 'error', text: `Failed to fetch rows: ${error.message ?? 'unknown'}` });
+      } else {
+        const fetched = (data as Hospital[]) || [];
+        setRows(fetched);
+        setHasColdEmailedColumn(fetched.some((r) => Object.prototype.hasOwnProperty.call(r, 'cold_emailed')));
+      }
+    } catch (err) {
+      console.error('Fetch error', err);
+      push({ type: 'error', text: 'Failed to fetch rows. See console.' });
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     fetchRows();
-    // realtime optional
-    // const ch = supabase.channel("hospitals-ch")
-    //   .on("postgres_changes",{event:"*",schema:"public",table:"hospitals"}, fetchRows)
-    //   .subscribe();
-    // return () => { supabase.removeChannel(ch); };
+
+    // subscribe to realtime changes for hospitals
+    const channel = supabase
+      .channel('realtime-hospitals')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'hospitals' }, () => {
+        fetchRows();
+      })
+      .subscribe();
+
+    return () => {
+      try {
+        if (typeof (channel as any).unsubscribe === 'function') (channel as any).unsubscribe();
+        else if (typeof supabase.removeChannel === 'function') supabase.removeChannel(channel);
+      } catch (e) {
+        console.warn('Error cleaning realtime channel', e);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // derive city options
+  // derived lists
   const cities = useMemo(() => {
-    const s = new Set<string>();
-    rows.forEach(r => r.city && s.add(r.city));
-    return Array.from(s).sort();
+    const set = new Set(rows.map((r) => (r.city || '').trim()).filter(Boolean));
+    return ['All cities', ...Array.from(set).sort()];
   }, [rows]);
 
+  const statuses = useMemo(() => {
+    const set = new Set(rows.map((r) => (r.status || '').trim()).filter(Boolean));
+    return ['All statuses', ...Array.from(set).sort()];
+  }, [rows]);
+
+  // filtered list
   const filtered = useMemo(() => {
-    let arr = [...rows];
-    if (q.trim()) {
-      const needle = q.toLowerCase();
-      arr = arr.filter(r => (
-        (r.name||"").toLowerCase().includes(needle) ||
-        (r.city||"").toLowerCase().includes(needle) ||
-        (r.address||"").toLowerCase().includes(needle) ||
-        (r.emails||[]).join(",").toLowerCase().includes(needle) ||
-        (r.phones||[]).join(",").toLowerCase().includes(needle) ||
-        (r.digital_services||"").toLowerCase().includes(needle)
-      ));
+    let out = rows.filter((r) => {
+      const hay = `${r.name || ''} ${r.city ?? ''} ${(Array.isArray(r.emails) ? r.emails : []).join(' ')} ${
+        Array.isArray(r.phones) ? r.phones.join(' ') : ''
+      } ${r.address ?? ''}`.toLowerCase();
+
+      if (q.trim() && !hay.includes(q.trim().toLowerCase())) return false;
+      if (city !== 'All cities' && (r.city ?? '') !== city) return false;
+      if (status !== 'All statuses' && (r.status ?? '') !== status) return false;
+
+      return true;
+    });
+
+    out = out.sort((a, b) => {
+      const d = sortDir === 'asc' ? 1 : -1;
+      if (sortKey === 'name') return d * ((a.name ?? '').localeCompare(b.name ?? ''));
+      if (sortKey === 'created_at') return d * (new Date(a.created_at ?? 0).getTime() - new Date(b.created_at ?? 0).getTime());
+      return 0;
+    });
+
+    return out;
+  }, [rows, q, city, status, sortKey, sortDir]);
+
+  // totals (cold-emailed is 0 if column missing)
+  const totals = useMemo(() => {
+    const total = rows.length;
+    const closed = rows.filter((r) => r.status === 'closed' || r.status === 'reached').length;
+    const open = total - closed;
+    const telemed = rows.filter((r) => r.telemedicine === true).length;
+    const emailed = hasColdEmailedColumn ? rows.filter((r) => r.cold_emailed === true).length : 0;
+    return { total, closed, open, telemed, emailed };
+  }, [rows, hasColdEmailedColumn]);
+
+  const toggleSelection = (id: string) => setSelected((s) => ({ ...s, [id]: !s[id] }));
+
+  // toggle status (closed/new) for single row
+  const toggleStatus = async (id: string, currentStatus?: string | null) => {
+    const isClosed = currentStatus === 'closed';
+    const target = isClosed ? 'new' : 'closed';
+    const prev = rows.find((r) => r.id === id)?.status ?? null;
+
+    // optimistic UI
+    setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, status: target } : r)));
+
+    try {
+      const { error } = await supabase.from('hospitals').update({ status: target }).eq('id', id);
+      if (error) {
+        console.error('Update status error', error);
+        push({ type: 'error', text: `Failed to update status: ${error.message ?? 'unknown'}` });
+        setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, status: prev } : r)));
+        await fetchRows();
+      } else {
+        push({ type: 'success', text: `Status updated` });
+      }
+    } catch (e: any) {
+      console.error('Unexpected status error', e);
+      push({ type: 'error', text: `Failed to update status: ${e?.message ?? String(e)}` });
+      setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, status: prev } : r)));
+      await fetchRows();
     }
-    if (city) arr = arr.filter(r => (r.city||"") === city);
-    if (statusFilter) arr = arr.filter(r => r.status === statusFilter);
-    arr.sort((a,b) => {
-      const av = a[sortKey] as any, bv = b[sortKey] as any;
-      if (av === bv) return 0;
-      const cmp = av > bv ? 1 : -1;
-      return sortDir === "asc" ? cmp : -cmp;
-    });
-    return arr;
-  }, [rows, q, city, statusFilter, sortKey, sortDir]);
+  };
 
-  function toggleSort(k: keyof Hospital){
-    if (sortKey === k) setSortDir(d => d === "asc" ? "desc" : "asc");
-    else { setSortKey(k); setSortDir("desc"); }
-  }
+  // toggle cold_emailed for single row (only if column exists)
+  const toggleColdEmail = async (id: string, current?: boolean | null) => {
+    if (!hasColdEmailedColumn) {
+      push({ type: 'error', text: 'cold_emailed column missing — please add it to DB.' });
+      return;
+    }
 
-  async function updateRow(id: string, patch: Partial<Hospital>){
-    const { data, error } = await supabase
-      .from("hospitals")
-      .update(patch)
-      .eq("id", id)
-      .select("*")
-      .single();
-    if (error) { console.error(error); return; }
-    setRows(prev => prev.map(r => r.id === id ? (data as Hospital) : r));
-  }
+    const target = !current;
+    const prev = rows.find((r) => r.id === id)?.cold_emailed ?? false;
 
-  async function setStatus(id: string, status: Hospital["status"]){
-    await updateRow(id, { status });
-  }
+    setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, cold_emailed: target } : r)));
 
-  async function setRating(id: string, rating: number){
-    const score = blendScore(0, rating);
-    await updateRow(id, { manual_rating: rating, score });
-  }
+    try {
+      const { error } = await supabase.from('hospitals').update({ cold_emailed: target }).eq('id', id);
 
-  async function addHospital(){
-    if (!form.name.trim()) return;
-    const tele = form.telemedicine === "yes" ? true : form.telemedicine === "no" ? false : null;
-    const emails = form.emails.split(",").map(s=>s.trim()).filter(Boolean);
-    const phones = form.phones.split(",").map(s=>s.trim()).filter(Boolean);
-    const { data, error } = await supabase
-      .from("hospitals")
-      .insert({
-        name: form.name.trim(),
-        city: form.city || null,
-        website: form.website || null,
-        emails, phones,
-        linkedin: form.linkedin || null,
-        address: form.address || null,
-        telemedicine: tele,
-        digital_services: form.digital_services || null,
-        status: "new",
-        manual_rating: 0,
-        score: 0
-      }).select("*").single();
-    if (error) { console.error(error); return; }
-    setRows(prev => [data as Hospital, ...prev]);
-    setForm({ name:"", city:"", website:"", emails:"", phones:"", linkedin:"", address:"", telemedicine:"unknown", digital_services:"" });
-  }
+      if (error) {
+        console.error('Update cold_emailed error', error);
+        push({ type: 'error', text: `Failed to update cold-emailed: ${error.message ?? 'unknown'}` });
+        setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, cold_emailed: prev } : r)));
+        await fetchRows();
+        return;
+      }
 
-  async function importCSV(file: File){
-    return new Promise<void>((resolve) => {
-      Papa.parse(file, {
-        header: true,
-        complete: async (res) => {
-          const rows = res.data as any[];
-          for (const r of rows){
-            if (!r.name && !r.Name) continue;
-            const name = (r.name || r.Name || "").trim();
-            const city = r.city || r.City || null;
-            const website = r.website || r.Website || null;
-            const teleRaw = r.telemedicine ?? r.Telemedicine ?? r.telemedicine_usage;
-            const tele = typeof teleRaw === "string"
-              ? (teleRaw.toLowerCase().startsWith("y") ? true : teleRaw.toLowerCase().startsWith("n") ? false : null)
-              : (teleRaw ?? null);
-            const emails = (r.emails || r.Email || r.email || "")
-              .toString().split(/[;,]/).map((s:string)=>s.trim()).filter(Boolean);
-            const phones = (r.phones || r.Phone || "")
-              .toString().split(/[;,]/).map((s:string)=>s.trim()).filter(Boolean);
-            const linkedin = r.linkedin || r.LinkedIn || null;
-            const address = r.address || r.Address || null;
-            const digital_services = r.digital_services || r["Digital Services"] || r.digital_services_description || null;
+      push({ type: 'success', text: target ? 'Marked cold-emailed' : 'Unmarked cold-emailed' });
 
-            await supabase.from("hospitals").insert({
-              name, city, website, telemedicine: tele, emails, phones, linkedin, address,
-              digital_services, status:"new", manual_rating:0, score:0
-            });
-          }
-          await fetchRows();
-          resolve();
+      // optional: also add an audit row to cold_emails table (no-op if table is missing)
+      try {
+        await supabase.from('cold_emails').insert([{ hospital_id: id, acted_by: null, note: target ? 'marked cold-emailed' : 'unmarked cold-emailed' }]);
+      } catch {
+        /* ignore audit insert failures */
+      }
+    } catch (e: any) {
+      console.error('Unexpected cold_emailed error', e);
+      push({ type: 'error', text: `Failed to update cold-emailed: ${e?.message ?? String(e)}` });
+      setRows((prevRows) => prevRows.map((r) => (r.id === id ? { ...r, cold_emailed: prev } : r)));
+      await fetchRows();
+    }
+  };
+
+  // bulk set status
+  const bulkSetStatus = async (target: string) => {
+    const ids = Object.keys(selected).filter((k) => selected[k]);
+    if (!ids.length) return push({ type: 'info', text: 'Select rows first' });
+
+    // optimistic
+    setRows((prevRows) => prevRows.map((r) => (ids.includes(r.id) ? { ...r, status: target } : r)));
+
+    try {
+      const { error } = await supabase.from('hospitals').update({ status: target }).in('id', ids);
+      if (error) {
+        console.error('Bulk status error', error);
+        push({ type: 'error', text: `Failed to update selected rows: ${error.message ?? 'unknown'}` });
+        await fetchRows();
+      } else {
+        setSelected({});
+        push({ type: 'success', text: `Updated ${ids.length} rows` });
+      }
+    } catch (e) {
+      console.error('Unexpected bulk status error', e);
+      push({ type: 'error', text: 'Failed to update selected rows. See console.' });
+      await fetchRows();
+    }
+  };
+
+  // bulk toggle cold_emailed
+  const bulkToggleColdEmail = async (markAs: boolean) => {
+    if (!hasColdEmailedColumn) {
+      push({ type: 'error', text: 'cold_emailed column missing. Cannot bulk update.' });
+      return;
+    }
+    const ids = Object.keys(selected).filter((k) => selected[k]);
+    if (!ids.length) return push({ type: 'info', text: 'Select rows first' });
+
+    setRows((prevRows) => prevRows.map((r) => (ids.includes(r.id) ? { ...r, cold_emailed: markAs } : r)));
+
+    try {
+      const { error } = await supabase.from('hospitals').update({ cold_emailed: markAs }).in('id', ids);
+      if (error) {
+        console.error('Bulk cold_emailed error', error);
+        push({ type: 'error', text: `Failed to update cold-emailed: ${error.message ?? 'unknown'}` });
+        await fetchRows();
+      } else {
+        // optional: add audit rows (best-effort)
+        try {
+          const auditRows = ids.map((id) => ({ hospital_id: id, acted_by: null, note: markAs ? 'bulk marked cold-emailed' : 'bulk unmarked cold-emailed' }));
+          await supabase.from('cold_emails').insert(auditRows);
+        } catch {
+          /* ignore */
         }
-      });
-    });
-  }
+        setSelected({});
+        push({ type: 'success', text: `${ids.length} rows updated` });
+      }
+    } catch (e) {
+      console.error('Unexpected bulk cold_emailed error', e);
+      push({ type: 'error', text: 'Failed to update selected rows. See console.' });
+      await fetchRows();
+    }
+  };
+
+  // CSV export
+  const exportCSV = () => {
+    const cols = ['name', 'city', 'status', hasColdEmailedColumn ? 'cold_emailed' : undefined, 'website', 'emails', 'phones'].filter(Boolean) as string[];
+    const body = filtered.map((r) =>
+      cols
+        .map((c) => {
+          const v = (r as any)[c];
+          if (Array.isArray(v)) return `"${v.join(';')}"`;
+          return `"${String(v ?? '')}"`;
+        })
+        .join(',')
+    );
+    const csv = [cols.join(','), ...body].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `hospitals-export-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    push({ type: 'success', text: 'Export started' });
+  };
+
+  const handleControlAction = (action: string) => {
+    if (action === 'Mark selected closed') return bulkSetStatus('closed');
+    if (action === 'Mark selected cold-emailed') return bulkToggleColdEmail(true);
+    if (action === 'Unmark selected cold-emailed') return bulkToggleColdEmail(false);
+    if (action === 'Export CSV') return exportCSV();
+    if (action === 'Refresh') return fetchRows();
+    push({ type: 'info', text: `Action: ${action}` });
+  };
+
+  const onSort = (key: typeof sortKey) => {
+    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSortKey(key);
+      setSortDir('asc');
+    }
+  };
+
+  const short = (s?: string | null, max = 30) => {
+    if (!s) return '—';
+    if (s.length <= max) return s;
+    return s.slice(0, max - 1) + '…';
+  };
 
   return (
-    <div className="container">
-      <h1>Hospitals</h1>
-      <div className="panel">
-        <div className="toolbar">
-          <input placeholder="Search name/city/address/email/phone…" value={q} onChange={e=>setQ(e.target.value)} />
-          <select value={city} onChange={e=>setCity(e.target.value)}>
-            <option value="">All cities</option>
-            {cities.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <select value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}>
-            <option value="">All statuses</option>
-            {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <label>
-            <input type="file" accept=".csv" style={{display:"none"}}
-              onChange={(e)=>{ const f=e.target.files?.[0]; if (f) importCSV(f); }} />
-            <button className="secondary">Import CSV</button>
-          </label>
-        </div>
+    <div className="min-h-screen bg-emerald-50 text-slate-900 p-4 md:p-6">
+      <div className="max-w-7xl mx-auto">
+        {/* header KPIs */}
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+          <h1 className="text-3xl md:text-4xl font-extrabold text-emerald-800">Hospitals</h1>
 
-        <div className="hr" />
-
-        <div style={{marginBottom:12}}>
-          <div className="row" style={{marginBottom:8}}>
-            <input placeholder="Name *" value={form.name} onChange={e=>setForm({...form, name:e.target.value})}/>
-            <input placeholder="City" value={form.city} onChange={e=>setForm({...form, city:e.target.value})}/>
-          </div>
-          <div className="row" style={{marginBottom:8}}>
-            <input placeholder="Website" value={form.website} onChange={e=>setForm({...form, website:e.target.value})}/>
-            <input placeholder="Emails (comma-separated)" value={form.emails} onChange={e=>setForm({...form, emails:e.target.value})}/>
-          </div>
-          <div className="row" style={{marginBottom:8}}>
-            <input placeholder="Phones (comma-separated)" value={form.phones} onChange={e=>setForm({...form, phones:e.target.value})}/>
-            <input placeholder="LinkedIn" value={form.linkedin} onChange={e=>setForm({...form, linkedin:e.target.value})}/>
-          </div>
-          <div className="row" style={{marginBottom:8}}>
-            <input placeholder="Address" value={form.address} onChange={e=>setForm({...form, address:e.target.value})}/>
-            <select value={form.telemedicine} onChange={e=>setForm({...form, telemedicine:e.target.value})}>
-              <option value="unknown">Telemedicine: Unknown</option>
-              <option value="yes">Telemedicine: Yes</option>
-              <option value="no">Telemedicine: No</option>
-            </select>
-          </div>
-          <textarea placeholder="Digital services / notes…" rows={2}
-            value={form.digital_services} onChange={e=>setForm({...form, digital_services:e.target.value})}/>
-          <div style={{display:"flex",gap:8,marginTop:10}}>
-            <button onClick={addHospital}>Add Hospital</button>
-            <button className="secondary" onClick={fetchRows}>Refresh</button>
-            <small className="muted">Add quickly; edit in table below.</small>
+          <div className="flex flex-wrap gap-3 items-center">
+            {[
+              { label: 'Total', value: totals.total },
+              { label: 'Open', value: totals.open },
+              { label: 'Reached / Closed', value: totals.closed, highlight: true },
+              { label: 'Telemedicine', value: totals.telemed },
+              { label: 'Cold-emailed', value: totals.emailed },
+            ].map((k) => (
+              <button
+                key={k.label}
+                onClick={() => {
+                  // quick filter behavior: clicking KPIs toggles status filter
+                  if (k.label === 'Reached / Closed') setStatus((s) => (s === 'closed' ? 'All statuses' : 'closed'));
+                }}
+                className={`bg-white rounded-lg p-3 text-slate-900 shadow-sm w-28 text-center transform transition hover:-translate-y-0.5 ${
+                  k.highlight ? 'border-l-4 border-emerald-300' : ''
+                }`}
+                title={`${k.label}`}
+              >
+                <div className="text-xs text-slate-500">{k.label}</div>
+                <div className={`text-lg font-semibold ${k.highlight ? 'text-emerald-700' : ''}`}>{k.value}</div>
+              </button>
+            ))}
           </div>
         </div>
 
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th onClick={()=>toggleSort("score")}>Score {sortKey==="score"?(sortDir==="asc"?"▲":"▼"): ""}</th>
-                <th onClick={()=>toggleSort("name")}>Name {sortKey==="name"?(sortDir==="asc"?"▲":"▼"): ""}</th>
-                <th>City</th>
-                <th>Telemed</th>
-                <th>Emails</th>
-                <th>Phones</th>
-                <th>Status</th>
-                <th>Rating</th>
-                <th>Links</th>
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr><td colSpan={9}>Loading…</td></tr>
-              ) : filtered.length === 0 ? (
-                <tr><td colSpan={9}>No rows.</td></tr>
-              ) : filtered.map(h => (
-                <tr key={h.id}>
-                  <td><span className="badge">{h.score}</span><br/><small className="muted">m {h.manual_rating}</small></td>
-                  <td>
-                    <div style={{fontWeight:600}}>{h.name}</div>
-                    {h.address ? <div><small className="muted">{h.address}</small></div> : null}
-                    {h.digital_services ? <div><small className="muted">{h.digital_services}</small></div> : null}
-                  </td>
-                  <td>{h.city || <small className="muted">—</small>}</td>
-                  <td>{h.telemedicine === null ? <small className="muted">—</small> : h.telemedicine ? "Yes" : "No"}</td>
-                  <td>{(h.emails||[]).length ? (h.emails||[]).map(e=><div key={e}><small>{e}</small></div>) : <small className="muted">—</small>}</td>
-                  <td>{(h.phones||[]).length ? (h.phones||[]).map(p=><div key={p}><small>{p}</small></div>) : <small className="muted">—</small>}</td>
-                  <td>
-                    <select value={h.status} onChange={(e)=>setStatus(h.id, e.target.value as Hospital["status"])}>
-                      {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
-                    </select>
-                  </td>
-                  <td>
-                    <select value={h.manual_rating} onChange={(e)=>setRating(h.id, Number(e.target.value))}>
-                      {[0,1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
-                    </select>
-                  </td>
-                  <td>
-                    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                      {h.website ? <a href={h.website} target="_blank">Website</a> : null}
-                      {h.linkedin ? <a href={h.linkedin} target="_blank">LinkedIn</a> : null}
-                    </div>
-                  </td>
-                </tr>
+        {/* controls */}
+        <div className="bg-white rounded-lg p-3 md:p-4 mb-6 shadow-sm">
+          <div className="flex flex-col md:flex-row gap-3 items-center">
+            <input
+              className="w-full md:flex-1 rounded-md px-4 py-2 border border-slate-200 placeholder-slate-400"
+              placeholder="Search name / city / email / phone..."
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
+
+            <select className="rounded-md px-3 py-2 border border-slate-200 bg-white" value={city} onChange={(e) => setCity(e.target.value)}>
+              {cities.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
               ))}
-            </tbody>
-          </table>
+            </select>
+
+            <select className="rounded-md px-3 py-2 border border-slate-200 bg-white" value={status} onChange={(e) => setStatus(e.target.value)}>
+              {statuses.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+
+            <Dropdown
+              label="Controls"
+              items={[
+                { value: 'Mark selected closed', label: 'Mark selected closed' },
+                { value: 'Mark selected cold-emailed', label: 'Mark selected cold-emailed' },
+                { value: 'Unmark selected cold-emailed', label: 'Unmark selected cold-emailed' },
+                { value: 'Export CSV', label: 'Export CSV' },
+                { value: 'Refresh', label: 'Refresh' },
+              ]}
+              onSelect={(v) => handleControlAction(String(v))}
+            />
+
+            <div className="flex gap-2">
+              <button
+                className="bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-md text-slate-900 font-semibold border border-slate-200"
+                onClick={() => fetchRows()}
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
         </div>
 
+        {/* responsive list: table for sm+, cards for mobile */}
+        <div className="bg-white rounded-lg text-slate-900 shadow overflow-hidden">
+          {/* TABLE (desktop) */}
+          <div className="hidden sm:block overflow-x-auto">
+            <table className="min-w-full divide-y">
+              <thead className="bg-emerald-50 sticky top-0">
+                <tr className="text-left text-slate-700">
+                  <th className="p-3 w-12">
+                    <input
+                      type="checkbox"
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        if (!checked) return setSelected({});
+                        const map: Record<string, boolean> = {};
+                        rows.forEach((r) => (map[r.id] = true));
+                        setSelected(map);
+                      }}
+                      aria-label="select all"
+                    />
+                  </th>
+
+                  <th className="p-3 cursor-pointer" onClick={() => onSort('name')}>
+                    <div className="flex items-center gap-2 text-sm font-medium">Name {sortKey === 'name' ? (sortDir === 'asc' ? '▲' : '▼') : null}</div>
+                  </th>
+
+                  <th className="p-3">City</th>
+                  <th className="p-3">Telemed</th>
+                  <th className="p-3">Emails</th>
+                  <th className="p-3">Phones</th>
+                  <th className="p-3">Status</th>
+                  <th className="p-3">Cold-emailed</th>
+                  <th className="p-3">Links</th>
+                  <th className="p-3 text-right">Actions</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {loading && (
+                  <tr>
+                    <td colSpan={10} className="p-6 text-center text-slate-500">
+                      Loading…
+                    </td>
+                  </tr>
+                )}
+
+                {!loading && filtered.length === 0 && (
+                  <tr>
+                    <td colSpan={10} className="p-8 text-center text-slate-500">
+                      No hospitals match.
+                    </td>
+                  </tr>
+                )}
+
+                {filtered.map((r) => (
+                  <tr key={r.id} className="hover:bg-emerald-25">
+                    <td className="p-3 align-top">
+                      <input type="checkbox" checked={!!selected[r.id]} onChange={() => toggleSelection(r.id)} aria-label={`select ${r.name}`} />
+                    </td>
+
+                    <td className="p-3 align-top font-semibold text-sm max-w-xs">
+                      <div className="truncate w-56">{r.name}</div>
+                      <div className="text-xs text-slate-500 truncate w-56">{r.address ?? ''}</div>
+                    </td>
+
+                    <td className="p-3 align-top text-sm">{r.city ?? '—'}</td>
+
+                    <td className="p-3 align-top text-sm">{r.telemedicine ? 'Yes' : 'No'}</td>
+
+                    <td className="p-3 align-top text-sm">{short(Array.isArray(r.emails) ? r.emails[0] : r.emails ?? '—', 36)}</td>
+
+                    <td className="p-3 align-top text-sm">{short(Array.isArray(r.phones) ? r.phones[0] : r.phones ?? '—', 24)}</td>
+
+                    <td className="p-3 align-top">
+                      <span className={`inline-block px-3 py-1 rounded-full text-sm ${r.status === 'closed' || r.status === 'reached' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-800'}`}>
+                        {r.status ?? 'new'}
+                      </span>
+                    </td>
+
+                    <td className="p-3 align-top text-sm">
+                      <span className={`inline-block px-3 py-1 rounded-full text-sm ${r.cold_emailed ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-800'}`}>
+                        {r.cold_emailed ? 'Yes' : 'No'}
+                      </span>
+                    </td>
+
+                    <td className="p-3 align-top text-sm">
+                      {r.website ? (
+                        <a className="text-emerald-600 underline" href={r.website} target="_blank" rel="noreferrer">
+                          site
+                        </a>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+
+                    <td className="p-3 align-top text-right">
+                      <div className="flex gap-2 justify-end">
+                        <button
+                          className={`px-3 py-2 rounded-md font-semibold text-sm ${r.cold_emailed ? 'bg-slate-100 text-slate-900 border border-slate-200' : 'bg-emerald-100 text-emerald-800'}`}
+                          onClick={() => toggleColdEmail(r.id, r.cold_emailed)}
+                          title={r.cold_emailed ? 'Unmark cold-emailed' : 'Mark as cold-emailed'}
+                        >
+                          {r.cold_emailed ? 'Unmark emailed' : 'Mark emailed'}
+                        </button>
+
+                        <button
+                          className={`px-3 py-2 rounded-md font-semibold text-sm ${r.status === 'closed' ? 'bg-slate-100 text-slate-900 border border-slate-200' : 'bg-emerald-100 text-emerald-800'}`}
+                          onClick={() => toggleStatus(r.id, r.status)}
+                          title={r.status === 'closed' ? 'Reopen' : 'Mark as closed'}
+                        >
+                          {r.status === 'closed' ? 'Reopen' : 'Mark closed'}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* CARD VIEW (mobile) */}
+          <div className="sm:hidden">
+            {loading && (
+              <div className="p-6 text-center text-slate-500">
+                Loading…
+              </div>
+            )}
+            {!loading && filtered.length === 0 && (
+              <div className="p-6 text-center text-slate-500">No hospitals match.</div>
+            )}
+            <div className="p-3 space-y-3">
+              {filtered.map((r) => (
+                <div key={r.id} className="bg-white border border-slate-100 rounded-lg p-3 shadow-sm">
+                  <div className="flex justify-between items-start gap-3">
+                    <div className="flex-1">
+                      <div className="font-semibold text-sm">{r.name}</div>
+                      <div className="text-xs text-slate-500">{r.city ?? '—'} • {short(r.address ?? '', 48)}</div>
+                      <div className="mt-2 text-xs text-slate-600">
+                        <div>{Array.isArray(r.emails) ? r.emails[0] : r.emails ?? '—'}</div>
+                        <div className="mt-1">{Array.isArray(r.phones) ? r.phones[0] : r.phones ?? '—'}</div>
+                      </div>
+                    </div>
+
+                    <div className="flex-shrink-0 text-right">
+                      <div className="text-xs">
+                        <span className={`inline-block px-2 py-1 rounded-full text-xs ${r.status === 'closed' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-800'}`}>{r.status ?? 'new'}</span>
+                      </div>
+                      <div className="mt-2 text-xs">
+                        <span className={`inline-block px-2 py-1 rounded-full text-xs ${r.cold_emailed ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-800'}`}>{r.cold_emailed ? 'Emailed' : 'Not emailed'}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <button
+                      className={`w-full px-3 py-2 rounded-md font-semibold text-sm ${r.cold_emailed ? 'bg-slate-100 text-slate-900 border border-slate-200' : 'bg-emerald-100 text-emerald-800'}`}
+                      onClick={() => toggleColdEmail(r.id, r.cold_emailed)}
+                    >
+                      {r.cold_emailed ? 'Unmark emailed' : 'Mark emailed'}
+                    </button>
+
+                    <button
+                      className={`w-full px-3 py-2 rounded-md font-semibold text-sm ${r.status === 'closed' ? 'bg-slate-100 text-slate-900 border border-slate-200' : 'bg-emerald-100 text-emerald-800'}`}
+                      onClick={() => toggleStatus(r.id, r.status)}
+                    >
+                      {r.status === 'closed' ? 'Reopen' : 'Mark closed'}
+                    </button>
+                  </div>
+
+                  <div className="mt-3 flex items-center justify-between text-xs">
+                    {r.website ? (
+                      <a className="text-emerald-600 underline" href={r.website} target="_blank" rel="noreferrer">
+                        Visit site
+                      </a>
+                    ) : (
+                      <span className="text-slate-400">No website</span>
+                    )}
+                    <span className="text-slate-500">{r.created_at ? new Date(r.created_at).toLocaleDateString() : ''}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 text-sm text-slate-600">
+          Showing <strong>{filtered.length}</strong> rows (total <strong>{rows.length}</strong>).
+        </div>
       </div>
+
+      {/* Toasts */}
+      <Toasts toasts={toasts} />
     </div>
   );
 }
