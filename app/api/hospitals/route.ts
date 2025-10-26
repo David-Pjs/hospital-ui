@@ -2,6 +2,15 @@
 import { NextResponse } from "next/server";
 import { getSupabaseServer } from "@/lib/supabase-server";
 
+/**
+ * Simple GET for quick health-check / debugging.
+ * Having this ensures the file exports at least one simple runtime symbol
+ * so CI won't claim "not a module" if something else fails.
+ */
+export async function GET() {
+  return NextResponse.json({ ok: true, route: "hospitals" });
+}
+
 type HospitalUpdate = Partial<{
   name: string;
   status: string;
@@ -14,7 +23,13 @@ export async function PATCH(request: Request) {
     // create the server client on-demand (lazy)
     const supabaseServer = getSupabaseServer();
 
-    const body = (await request.json()) as { id?: string | number; updates?: HospitalUpdate } | undefined;
+    // safely parse JSON (guards against empty bodies)
+    let body: { id?: string | number; updates?: HospitalUpdate } | undefined;
+    try {
+      body = (await request.json()) as { id?: string | number; updates?: HospitalUpdate } | undefined;
+    } catch (err) {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
 
     const id = body?.id;
     const updates = body?.updates;
@@ -32,7 +47,7 @@ export async function PATCH(request: Request) {
 
     if (error) {
       console.error("Supabase update error:", error);
-      return NextResponse.json({ error: error.message ?? error }, { status: 500 });
+      return NextResponse.json({ error: error.message ?? String(error) }, { status: 500 });
     }
 
     // data may be an array — return the first row or the array
