@@ -7,7 +7,6 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 /**
  * Create and return a Supabase server client when called.
  * Throws only when called and required env is missing.
- * This prevents throwing at module import time (which breaks Next.js build).
  */
 export function getSupabaseServer(): SupabaseClient {
   if (!SUPABASE_URL) {
